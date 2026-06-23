@@ -1,0 +1,215 @@
+import os
+import pandas as pd
+import yfinance as yf
+
+# ==============================
+# CONFIG
+# ==============================
+DATA_FILE = "nse_data.csv"
+OUTPUT_FILE = "price_gain_after_4q.csv"
+EPS_WINDOW = 4
+
+# ==============================
+# CLEAN ONE STOCK
+# ==============================
+def clean_stock_df(df):
+    df = df.copy()
+
+    df["eps"] = pd.to_numeric(df["eps"], errors="coerce")
+    df["pe"] = pd.to_numeric(df["pe"], errors="coerce")
+    df["price"] = pd.to_numeric(df["price"], errors="coerce")
+    df["qtr"] = pd.to_datetime(df["qtr"], errors="coerce")
+
+    df = df.dropna(subset=["stock", "qtr", "eps", "price"])
+    df = df[df["eps"] > 0]
+
+    df = (
+        df.sort_values("qtr")
+          .drop_duplicates(subset=["qtr"], keep="last")
+          .reset_index(drop=True)
+    )
+
+    # Calculate TTM EPS
+    df["ttm_eps"] = df["eps"].rolling(4).sum()
+
+    # Calculate TTM PE
+    df["ttm_pe"] = df["price"] / df["ttm_eps"]
+
+    # Remove invalid rows
+    df = df.dropna(subset=["ttm_eps", "ttm_pe"])
+    df = df[(df["ttm_pe"] > 0) & (df["ttm_pe"] < 200)]
+    df = df.reset_index(drop=True)
+
+    return df
+
+# ==============================
+# CONTINUITY CHECK
+# ==============================
+def continuity_ok(df):
+    if len(df) < 2:
+        return False
+    gaps = df["qtr"].diff().dropna().dt.days
+    return gaps.between(80, 100).all()
+
+# ==============================
+# FIND FIRST 4-QTR STREAK
+# EPS UP AND PE DOWN
+# Returns the index of the 4th quarter in that streak
+# ==============================
+EPS_WINDOW = 4
+
+def find_first_streak_end_idx(df):
+    eps_up = df["ttm_eps"].diff() > 0
+    pe_down = df["ttm_pe"].diff() < 0
+
+    cond = eps_up & pe_down
+
+    streak = cond.rolling(EPS_WINDOW - 1).sum()
+
+    idx = streak[streak == (EPS_WINDOW - 1)].index
+
+    matches = streak[streak == (EPS_WINDOW - 1)]
+
+    if not matches.empty:
+        return matches.index[0]
+
+    return None
+
+# ==============================
+# GET MAX PRICE FROM REFERENCE DATE
+# Uses High if available, else Close
+# ==============================
+def get_max_price_after_date(symbol, ref_date, ref_price):
+    ref_date = pd.to_datetime(ref_date).normalize()
+    end_date = pd.Timestamp.today().normalize() + pd.Timedelta(days=1)
+
+    try:
+        hist = yf.download(
+            symbol,
+            start=ref_date,
+            end=end_date,
+            progress=False,
+            auto_adjust=False,
+            threads=False
+        )
+
+        if hist is None or hist.empty:
+            return None
+    except Exception as e:
+        print(f"Error fetching data for {symbol}: {e}")
+        return None
+
+    hist = hist.reset_index()
+
+    # Flatten weird MultiIndex cases if they appear
+    if isinstance(hist.columns, pd.MultiIndex):
+        hist.columns = [c[0] if isinstance(c, tuple) else c for c in hist.columns]
+
+    if "Date" not in hist.columns:
+        return None
+
+    hist["Date"] = pd.to_datetime(hist["Date"], errors="coerce")
+    hist = hist.dropna(subset=["Date"])
+
+    price_col = None
+    if "High" in hist.columns and hist["High"].notna().any():
+        price_col = "High"
+    elif "Close" in hist.columns and hist["Close"].notna().any():
+        price_col = "Close"
+    else:
+        return None
+
+    series = pd.to_numeric(hist[price_col], errors="coerce")
+    hist = hist.loc[series.notna()].copy()
+    hist[price_col] = series.dropna()
+
+    if hist.empty:
+        return None
+
+    peak_idx = hist[price_col].idxmax()
+    max_price = float(hist.loc[peak_idx, price_col])
+
+    max_date_raw = hist.loc[peak_idx, "Date"]
+    if isinstance(max_date_raw, pd.Series):
+        max_date_raw = max_date_raw.iloc[0]
+    max_date = pd.to_datetime(max_date_raw).normalize()
+
+    ref_price = float(ref_price)
+
+    gain_abs = max_price - ref_price
+    gain_pct = (gain_abs / ref_price) * 100 if ref_price else None
+    days_taken = int((max_date - ref_date).days)
+
+    return {
+        "stock": symbol,
+        "reference_date": ref_date.date(),
+        "reference_price": round(ref_price, 2),
+        "max_date": max_date.date(),
+        "max_price": round(max_price, 2),
+        "gain_abs": round(gain_abs, 2),
+        "gain_pct": round(gain_pct, 2) if gain_pct is not None else None,
+        "days_taken": days_taken,
+    }
+
+# ==============================
+# MAIN
+# ==============================
+def run():
+    if not os.path.exists(DATA_FILE):
+        print(f"CSV not found: {DATA_FILE}")
+        return
+
+    df = pd.read_csv(DATA_FILE)
+
+    required_cols = {"stock", "qtr", "eps", "pe", "price"}
+    missing = required_cols - set(df.columns)
+    if missing:
+        print(f"Missing columns in CSV: {missing}")
+        return
+
+    results = []
+    selected_count = 0
+
+    for stock, g in df.groupby("stock"):
+        g = clean_stock_df(g)
+
+        if len(g) < EPS_WINDOW:
+            continue
+
+        if not continuity_ok(g):
+            continue
+
+        end_idx = find_first_streak_end_idx(g)
+        if end_idx is None:
+            continue
+
+        selected_count += 1
+
+        ref_row = g.loc[end_idx]
+        ref_date = ref_row["qtr"]
+        ref_price = ref_row["price"]
+
+        out = get_max_price_after_date(stock, ref_date, ref_price)
+        if out is not None:
+            results.append(out)
+
+    print(f"\nSelected stocks: {selected_count}")
+
+    if not results:
+        print("No results found.")
+        return
+
+    result_df = pd.DataFrame(results)
+
+    # sort by gain %
+    if "gain_pct" in result_df.columns:
+        result_df = result_df.sort_values(by="gain_pct", ascending=False)
+
+    print("\nResults:")
+    print(result_df.to_string(index=False))
+
+    result_df.to_csv(OUTPUT_FILE, index=False)
+    print(f"\nSaved -> {OUTPUT_FILE}")
+
+if __name__ == "__main__":
+    run()
