@@ -1,11 +1,19 @@
 """
-Indian Stock Screener – Master Table Pipeline
-=============================================
+Indian Stock Screener – Master Financial Pipeline
+=================================================
+
 Stage 1 : Fetch NSE symbols
-Stage 2 : Detect price-doubling events
-Stage 3 : Filter by market-cap, enrich with D/E ratio
-Stage 4 : Scrape master financial table (quarterly P&L, yearly P&L, balance sheet, cash flow)
-Stage 5 : Save EVENTS_CSV + MASTER_CSV
+Stage 2 : Process stocks
+          • ENABLE_DOUBLING_FILTER = True  → keep only stocks that doubled within WINDOW_DAYS
+          • ENABLE_DOUBLING_FILTER = False → process all eligible NSE stocks
+Stage 3 : Filter by minimum market capitalization and enrich with Debt/Equity ratio
+Stage 4 : Scrape Screener.in master financial tables
+          • Quarterly Profit & Loss
+          • Annual Profit & Loss
+          • Balance Sheet
+          • Cash Flow
+Stage 5 : Save processed stock list (EVENTS_CSV)
+Stage 6 : Save master financial dataset (MASTER_CSV)
 
 Run:
     pip install yfinance beautifulsoup4 lxml pandas numpy requests
@@ -52,6 +60,7 @@ except Exception:
 # ══════════════════════════════════════════════════════════════════════════════
 # CONFIG
 # ══════════════════════════════════════════════════════════════════════════════
+ENABLE_DOUBLING_FILTER = False  # set False to skip doubling filter and just collect master tables
 PERIOD = "1y"              # yfinance history window
 WINDOW_DAYS = 90            # rolling window to detect doubling
 THRESHOLD = 2.0             # price must reach 2× start price
@@ -63,7 +72,7 @@ MIN_MCAP = MIN_MCAP_CRORE * 10 ** 7
 LOOKBACK_DAYS = 730         # keep only financial rows within 2 years before event
 REQUEST_TIMEOUT = 20
 SCREENER_DELAY = 0.4        # polite delay for Screener.in requests
-NSE_SCAN_LIMIT = 2500        # number of NSE stocks to scan first
+NSE_SCAN_LIMIT = 3000       # number of NSE stocks to scan first
 INCLUDE_SHAREHOLDING = False  # easy extension later
 
 SAVE_DIR = Path(os.environ.get("STOCK_REPORT_DIR", Path.home() / "stock_reports"))
@@ -233,15 +242,16 @@ def _find_doubling_event(prices: pd.Series, symbol: str) -> dict | None:
 
 def screen_for_doubling(symbols: list[str]) -> list[dict]:
     """
-    Download OHLCV in batches, detect doubling events, filter by market-cap.
-    Returns list of enriched event dicts.
+    Downloads OHLCV in batches and returns event dicts.
+    If ENABLE_DOUBLING_FILTER is True, filters for price-doubling events.
+    Always filters by MIN_DATA_POINTS and MIN_MCAP.
     """
     results = []
     total_batches = (len(symbols) + BATCH_SIZE - 1) // BATCH_SIZE
 
     for batch_no, i in enumerate(range(0, len(symbols), BATCH_SIZE), 1):
         batch = [str(s) for s in symbols[i : i + BATCH_SIZE]]
-        print(f"\n[{batch_no}/{total_batches}] Downloading batch …")
+        print(f"\n[{batch_no}/{total_batches}] Processing batch …")
 
         try:
             data = yf.download(
@@ -258,18 +268,33 @@ def screen_for_doubling(symbols: list[str]) -> list[dict]:
 
         for symbol in batch:
             try:
-                if len(batch) == 1:
-                    prices = data["Close"]
-                else:
-                    prices = data[symbol]["Close"]
+                # Handle single vs multiple ticker return formats from yfinance
+                prices = data[symbol]["Close"] if len(batch) > 1 else data["Close"]
 
-                if len(prices.dropna()) < MIN_DATA_POINTS:
+                # 1. Basic Data Integrity Check (Required regardless of filter state)
+                prices_clean = prices.dropna()
+                if len(prices_clean) < MIN_DATA_POINTS:
                     continue
 
-                event = _find_doubling_event(prices, symbol)
-                if not event:
-                    continue
+                # 2. Setup the "event" base object with standard start/end data
+                event = {
+                    "stock": symbol,
+                    "start_date": prices_clean.index[0],
+                    "end_date": prices_clean.index[-1],
+                    "start_price": prices_clean.iloc[0],
+                    "double_price": prices_clean.iloc[-1],
+                    "double_date": None,
+                    "days_to_double": None,
+                }
 
+                # 3. Conditional Doubling Logic
+                if ENABLE_DOUBLING_FILTER:
+                    doubling_result = _find_doubling_event(prices, symbol)
+                    if not doubling_result:
+                        continue  # Skip if filter is ON but stock didn't double
+                    event.update(doubling_result)  # Apply specific dates/prices
+
+                # 4. Fundamentals Check (Required for all stocks)
                 info = yf.Ticker(symbol).info
                 shares = info.get("sharesOutstanding")
                 if not shares:
@@ -279,18 +304,21 @@ def screen_for_doubling(symbols: list[str]) -> list[dict]:
                 if ref_mcap < MIN_MCAP:
                     continue
 
+                # 5. Append to results
                 results.append({
                     "stock": event["stock"],
                     "start_date": pd.to_datetime(event["start_date"]).date(),
                     "end_date": pd.to_datetime(event["end_date"]).date(),
-                    "double_date": pd.to_datetime(event["double_date"]).date(),
+                    "double_date": pd.to_datetime(event["double_date"]).date() if event["double_date"] else None,
                     "start_price": round(event["start_price"], 2),
                     "double_price": round(event["double_price"], 2),
                     "ref_mcap_cr": round(ref_mcap / 10 ** 7, 2),
                     "de_ratio": info.get("debtToEquity"),
                     "days_to_double": event["days_to_double"],
                 })
-                print(f"  ✔ {symbol} doubled in {event['days_to_double']} days")
+                
+                status = "doubled" if ENABLE_DOUBLING_FILTER else "processed"
+                print(f"  ✔ {symbol} {status}")
 
             except Exception as e:
                 print(f"  ✗ {symbol}: {e}")
@@ -310,7 +338,8 @@ def save_events(results: list[dict]) -> pd.DataFrame:
         print("\n⚠ No doubling events found.")
         return pd.DataFrame()
 
-    df = pd.DataFrame(results).sort_values("double_date").reset_index(drop=True)
+    sort_col = "double_date" if ENABLE_DOUBLING_FILTER else "stock"
+    df = pd.DataFrame(results).sort_values(sort_col).reset_index(drop=True)
     df.to_csv(EVENTS_CSV, index=False)
     print(f"\n✅ Events saved → {EVENTS_CSV}  ({len(df)} rows)")
     return df
@@ -495,37 +524,57 @@ def scrape_master_financials_for_symbol(nse_symbol: str) -> pd.DataFrame:
 
 def fetch_master_features(events_df: pd.DataFrame) -> pd.DataFrame:
     """
-    For every doubled stock, pull master financial rows and keep only rows
-    within LOOKBACK_DAYS before the doubling date.
+    Fetch Screener master financials.
+
+    ENABLE_DOUBLING_FILTER = True
+        -> Fetch only doubling stocks and keep LOOKBACK_DAYS before double_date.
+
+    ENABLE_DOUBLING_FILTER = False
+        -> Fetch every stock and keep all financial data.
     """
+
     if events_df.empty:
         return pd.DataFrame()
 
     frames = []
     stocks = events_df["stock"].unique().tolist()
+
     print(f"\nFetching master financials for {len(stocks)} stocks …")
 
     for symbol in stocks:
         try:
             master = scrape_master_financials_for_symbol(symbol)
+
             if master.empty:
                 print(f"  ✗ {symbol}: no financial tables")
                 continue
 
-            event_row = events_df.loc[events_df["stock"] == symbol].iloc[0]
-            cutoff = pd.Timestamp(event_row["double_date"]) - pd.Timedelta(days=LOOKBACK_DAYS)
             master["period_end"] = pd.to_datetime(master["period_end"])
-            master = master[(master["period_end"] >= cutoff) & (master["period_end"] <= pd.Timestamp(event_row["double_date"]))]
+
+            if ENABLE_DOUBLING_FILTER:
+                event_row = events_df.loc[
+                    events_df["stock"] == symbol
+                ].iloc[0]
+
+                double_date = pd.Timestamp(event_row["double_date"])
+                cutoff = double_date - pd.Timedelta(days=LOOKBACK_DAYS)
+
+                master = master[
+                    (master["period_end"] >= cutoff) &
+                    (master["period_end"] <= double_date)
+                ]
+
+            # When ENABLE_DOUBLING_FILTER=False
+            # do not filter by dates at all.
 
             if not master.empty:
                 frames.append(master)
                 print(f"  ✔ {symbol}: {len(master)} master rows")
             else:
-                print(f"  ✗ {symbol}: no rows inside lookback window")
+                print(f"  ✗ {symbol}: no usable rows")
 
         except Exception as e:
             print(f"  ✗ {symbol}: {e}")
-            continue
 
         time.sleep(SCREENER_DELAY)
 
@@ -533,7 +582,11 @@ def fetch_master_features(events_df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
 
     out = pd.concat(frames, ignore_index=True)
-    out.sort_values(["stock", "statement_type", "period_end", "line_item_key"], inplace=True)
+    out.sort_values(
+        ["stock", "statement_type", "period_end", "line_item_key"],
+        inplace=True,
+    )
+
     return out
 
 
@@ -621,18 +674,6 @@ def main():
 
     # Stage 5
     save_master(master_df)
-
-    # Stage 6
-    summary_df, detail_df = validate_doubling_theory(events_df, master_df)
-
-    detail_csv = SAVE_DIR / "eps_pe_detail.csv"
-    if not detail_df.empty:
-      detail_df.to_csv(detail_csv, index=False)
-      print(f"✅ EPS/PE detail saved → {detail_csv}")
-
-    print("\nEPS/PE validation summary:")
-    if not summary_df.empty:
-      print(summary_df[["stock", "status", "quarters_found", "eps_expands", "pe_contracts"]].head(20))
 
     print("\n🏁 Pipeline complete.")
     print(f"   Doubling events  : {len(events_df)}")
