@@ -5,8 +5,8 @@ import yfinance as yf
 # ==============================
 # CONFIG
 # ==============================
-DATA_FILE = "nse_data.csv"
-OUTPUT_FILE = "price_gain_after_4q.csv"
+DATA_FILE = "nse_data_march_2026.csv"
+OUTPUT_FILE = "compressed_coil_4q_2026Mar.csv"
 EPS_WINDOW = 4
 
 # ==============================
@@ -18,14 +18,14 @@ def clean_stock_df(df):
     df["eps"] = pd.to_numeric(df["eps"], errors="coerce")
     df["pe"] = pd.to_numeric(df["pe"], errors="coerce")
     df["price"] = pd.to_numeric(df["price"], errors="coerce")
-    df["qtr"] = pd.to_datetime(df["qtr"], errors="coerce")
+    df["quarter_end"] = pd.to_datetime(df["quarter_end"], errors="coerce")
 
-    df = df.dropna(subset=["stock", "qtr", "eps", "price"])
+    df = df.dropna(subset=["stock", "quarter_end", "eps", "price"])
     df = df[df["eps"] > 0]
 
     df = (
-        df.sort_values("qtr")
-          .drop_duplicates(subset=["qtr"], keep="last")
+        df.sort_values("quarter_end")
+          .drop_duplicates(subset=["quarter_end"], keep="last")
           .reset_index(drop=True)
     )
 
@@ -48,7 +48,7 @@ def clean_stock_df(df):
 def continuity_ok(df):
     if len(df) < 2:
         return False
-    gaps = df["qtr"].diff().dropna().dt.days
+    gaps = df["quarter_end"].diff().dropna().dt.days
     return gaps.between(80, 100).all()
 
 # ==============================
@@ -161,7 +161,7 @@ def run():
 
     df = pd.read_csv(DATA_FILE)
 
-    required_cols = {"stock", "qtr", "eps", "pe", "price"}
+    required_cols = {"stock", "quarter_end", "eps", "pe", "price"}
     missing = required_cols - set(df.columns)
     if missing:
         print(f"Missing columns in CSV: {missing}")
@@ -186,7 +186,7 @@ def run():
         selected_count += 1
 
         ref_row = g.loc[end_idx]
-        ref_date = ref_row["qtr"]
+        ref_date = ref_row["quarter_end"]
         ref_price = ref_row["price"]
 
         out = get_max_price_after_date(stock, ref_date, ref_price)
